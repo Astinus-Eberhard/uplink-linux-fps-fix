@@ -1,0 +1,127 @@
+name: Build and release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Highest GLIBC_* symbol version the shipped binary is allowed to require.
+  # 2.34 is what dlsym() costs (it moved from libdl into libc in glibc 2.34);
+  # everything else this shim uses is far older. Raising this number silently
+  # drops users on older distros, so the build fails instead.
+  GLIBC_MAX: '2.34'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # Debian 12 (glibc 2.36) is the build environment on purpose. A binary is
+    # only as portable as the glibc it was linked against, and the hosted
+    # ubuntu-latest image raises its glibc with every image bump — a fix built
+    # there would stop loading on distros that are perfectly capable of running
+    # the game. bookworm keeps the requirement at GLIBC_2.34 (Ubuntu 22.04+,
+    # Debian 12+, Fedora 35+, current Arch/SteamOS).
+    container: debian:bookworm
+    steps:
+      - name: Install build tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            bash build-essential binutils file git ca-certificates
+
+      - uses: actions/checkout@v7
+
+      - name: Build
+        run: make
+
+      - name: Verify artifact
+        # Jawny bash: runner w kontenerze potrafi wybrać /bin/sh (dash), a ten
+        # odrzuca `set -o pipefail` błędem i kończy krok kodem 2, zanim
+        # wykona się cokolwiek innego.
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          file libbitmapcache.so
+          file libbitmapcache.so | grep -q 'ELF 64-bit LSB shared object, x86-64'
+
+          # The whole shim is one interposed symbol. If it is not exported,
+          # LD_PRELOAD loads the library and changes nothing.
+          nm -D --defined-only libbitmapcache.so | grep -qE ' T glBitmap$'
+
+          # Portability floor, see GLIBC_MAX above.
+          MAX=$(objdump -T libbitmapcache.so | grep -oP 'GLIBC_\K[0-9.]+' | sort -uV | tail -n1)
+          echo "highest glibc symbol version required: GLIBC_${MAX} (limit: GLIBC_${GLIBC_MAX})"
+          if [ "$(printf '%s\n%s\n' "$MAX" "$GLIBC_MAX" | sort -V | tail -n1)" != "$GLIBC_MAX" ]; then
+            echo "::error::binary requires GLIBC_${MAX}, above the GLIBC_${GLIBC_MAX} portability floor"
+            exit 1
+          fi
+
+          # Actually load it. Catches a library that builds but is unloadable
+          # (bad relocations, missing deps) — the failure mode LD_PRELOAD is
+          # notorious for hiding behind a warning nobody reads.
+          LD_PRELOAD="$PWD/libbitmapcache.so" /bin/true
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            VERSION="${GITHUB_REF_NAME}"
+          else
+            VERSION="${GITHUB_SHA:0:7}"
+          fi
+          PKG="uplink-fps-fix-${VERSION}-linux-x86_64"
+
+          mkdir -p "dist/${PKG}"
+          cp libbitmapcache.so launch-with-fix.sh README.md LICENSE "dist/${PKG}/"
+          chmod 755 "dist/${PKG}/launch-with-fix.sh"
+          tar -C dist -czf "dist/${PKG}.tar.gz" "${PKG}"
+          rm -rf "dist/${PKG}"
+
+          # Loose files too: most people just want to drop the .so next to
+          # start.sh without unpacking anything.
+          cp libbitmapcache.so launch-with-fix.sh dist/
+          chmod 755 dist/launch-with-fix.sh
+
+          ( cd dist && sha256sum "${PKG}.tar.gz" libbitmapcache.so launch-with-fix.sh > SHA256SUMS && cat SHA256SUMS )
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: dist
+          path: dist
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -l dist
+          gh release create "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "Uplink Linux FPS fix ${GITHUB_REF_NAME}" \
+            --verify-tag \
+            --notes-file .github/release-notes.md \
+            --generate-notes \
+            dist/*
